@@ -1,180 +1,109 @@
 import streamlit as st
 import tensorflow as tf
 import numpy as np
-import cv2
-import pandas as pd
-from PIL import Image
-import plotly.express as px
 import json
+import os
+from PIL import Image
 
-# --- 1. PAGE CONFIG & STYLING ---
-st.set_page_config(page_title="CoffeeDoc AI", page_icon="☕", layout="wide")
+# --- CLOUD PATH CONFIGURATION ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, 'coffee_leaf_model.keras')
+LABELS_PATH = os.path.join(BASE_DIR, 'class_names.json')
 
-st.markdown("""
-    <style>
-    .main { background-color: #f5f7f9; }
-    .prediction-card {
-        padding: 25px;
-        border-radius: 15px;
-        background: linear-gradient(135deg, #1e5128 0%, #4e944f 100%);
-        color: white;
-        text-align: center;
-        box-shadow: 0 10px 20px rgba(0,0,0,0.1);
-    }
-    .stMetric { background-color: #ffffff; padding: 15px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
-    </style>
-    """, unsafe_allow_html=True)
+# Page Config
+st.set_page_config(page_title="CoffeeDoc AI", page_icon="☕", layout="centered")
 
-# --- 2. CORE LOGIC ---
-
-@st.cache_resource
-def load_model():
-    return tf.keras.models.load_model('coffee_leaf_model.keras')
-
-@st.cache_resource
-def load_class_names():
-    """Loads the exact label order saved during training."""
-    try:
-        with open('class_names.json', 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        st.warning("class_names.json not found! Using default alphabetical order.")
-        return ['Healthy', 'Leaf_miner', 'Rust']
-
-def is_valid_leaf(image):
-    """Gatekeeper: Checks if the image has enough green/leaf-like colors."""
-    img_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2HSV)
-    lower_green = np.array([25, 40, 40])
-    upper_green = np.array([95, 255, 255])
-    mask = cv2.inRange(img_cv, lower_green, upper_green)
-    green_ratio = np.sum(mask > 0) / (image.size[0] * image.size[1])
-    return green_ratio > 0.05
-
-def get_refined_gradcam(img_array, model, last_conv_layer_name, threshold):
-    """Refined Grad-CAM to isolate disease spots from background."""
-    grad_model = tf.keras.models.Model(
-        [model.inputs], [model.get_layer(last_conv_layer_name).output, model.output]
-    )
-    with tf.GradientTape() as tape:
-        last_conv_output, preds = grad_model(img_array)
-        class_idx = np.argmax(preds[0])
-        class_channel = preds[:, class_idx]
-
-    grads = tape.gradient(class_channel, last_conv_output)
-    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-    heatmap = last_conv_output[0] @ pooled_grads[..., tf.newaxis]
-    heatmap = tf.squeeze(heatmap)
-    
-    heatmap = tf.maximum(heatmap, 0) / tf.math.reduce_max(heatmap)
-    heatmap = heatmap.numpy()
-    heatmap[heatmap < threshold] = 0
-    return heatmap
-
-# --- 3. TRANSLATIONS ---
-LANG_DICT = {
-    'English': {
-        'title': "CoffeeDoc AI: Smart Diagnosis",
-        'upload': "Upload a leaf photo",
-        'analysis': "AI Diagnostic Analysis",
-        'conf': "Confidence Level",
-        'advice': "Farmer's Action Plan",
-        'invalid': "❌ Invalid Image: This doesn't look like a coffee leaf. Please take a clear photo of a leaf.",
-        'classes': {'Healthy': 'Healthy', 'Rust': 'Coffee Leaf Rust', 'Leaf_miner': 'Leaf Miner'},
-        'tips': {
-            'Healthy': ["Continue regular monitoring", "Check soil pH levels"],
-            'Rust': ["Apply Copper-based fungicide", "Prune for better airflow"],
-            'Leaf_miner': ["Introduce predatory wasps", "Remove infested leaves"]
-        }
+# --- TRANSLATIONS ---
+translations = {
+    "English": {
+        "title": "☕ Coffee Leaf Disease AI",
+        "subtitle": "Upload a photo of a coffee leaf for diagnosis.",
+        "uploader": "Choose a leaf image...",
+        "button": "🔍 Run Diagnosis",
+        "loading": "AI is analyzing...",
+        "confidence": "Confidence Level",
+        "Healthy": "Healthy",
+        "Rust": "Coffee Rust",
+        "Leaf_miner": "Leaf Miner",
+        "advice_rust": "⚠️ **Action:** Apply copper-based fungicides and prune affected branches.",
+        "advice_miner": "⚠️ **Action:** Remove mined leaves and consider organic neem oil.",
+        "advice_healthy": "✅ **Great News:** This leaf appears to be healthy!",
+        "footer": "Disclaimer: Consult an agronomist for critical decisions."
     },
-    'Kannada': {
-        'title': "ಕಾಫಿಡಾಕ್ AI: ಸ್ಮಾರ್ಟ್ ರೋಗ ಪತ್ತೆ",
-        'upload': "ಎಲೆಯ ಚಿತ್ರವನ್ನು ಅಪ್‌ಲೋಡ್ ಮಾಡಿ",
-        'analysis': "AI ರೋಗನಿರ್ಣಯದ ವಿಶ್ಲೇಷಣೆ",
-        'conf': "ನಿಖರತೆಯ ಮಟ್ಟ",
-        'advice': "ರೈತರಿಗೆ ಸಲಹೆಗಳು",
-        'invalid': "❌ ಅಮಾನ್ಯ ಚಿತ್ರ: ಇದು ಕಾಫಿ ಎಲೆಯಂತೆ ಕಾಣುತ್ತಿಲ್ಲ. ದಯವಿಟ್ಟು ಸ್ಪಷ್ಟವಾದ ಎಲೆಯ ಫೋಟೋ ತೆಗೆಯಿರಿ.",
-        'classes': {'Healthy': 'ಆರೋಗ್ಯಕರ', 'Rust': 'ಎಲೆ ತುಕ್ಕು ರೋಗ', 'Leaf_miner': 'ಎಲೆ ಕೊರೆಯುವ ಹುಳು'},
-        'tips': {
-            'Healthy': ["ನಿಯಮಿತ ಮೇಲ್ವಿಚಾರಣೆ ಮುಂದುವರಿಸಿ", "ಮಣ್ಣಿನ pH ಮಟ್ಟವನ್ನು ಪರೀಕ್ಷಿಸಿ"],
-            'Rust': ["ತಾಮ್ರ ಆಧಾರಿತ ಶಿಲೀಂಧ್ರನಾಶಕ ಬಳಸಿ", "ಗಾಳಿಯಾಡಲು ಕೊಂಬೆ ಕತ್ತರಿಸಿ"],
-            'Leaf_miner': ["ಕೀಟನಾಶಕಗಳನ್ನು ಬಳಸಿ", "ಪೀಡಿತ ಎಲೆಗಳನ್ನು ಸುಟ್ಟು ಹಾಕಿ"]
-        }
+    "ಕನ್ನಡ": {
+        "title": "☕ ಕಾಫಿ ಎಲೆ ರೋಗ ಪತ್ತೆ ಹಚ್ಚುವ AI",
+        "subtitle": "ರೋಗ ಪತ್ತೆಹಚ್ಚಲು ಕಾಫಿ ಎಲೆಯ ಫೋಟೋವನ್ನು ಅಪ್‌ಲೋಡ್ ಮಾಡಿ.",
+        "uploader": "ಎಲೆಯ ಚಿತ್ರವನ್ನು ಆರಿಸಿ...",
+        "button": "🔍 ರೋಗ ಪತ್ತೆಹಚ್ಚಿ",
+        "loading": "AI ವಿಶ್ಲೇಷಿಸುತ್ತಿದೆ...",
+        "confidence": "ನಂಬಿಕೆಯ ಮಟ್ಟ",
+        "Healthy": "ಆರೋಗ್ಯಕರವಾಗಿದೆ",
+        "Rust": "ಕಾಫಿ ತುಕ್ಕು ರೋಗ (Rust)",
+        "Leaf_miner": "ಎಲೆ ಕೊರೆಯುವ ಹುಳು (Leaf Miner)",
+        "advice_rust": "⚠️ **ಪರಿಹಾರ:** ತಾಮ್ರ ಆಧಾರಿತ ಶಿಲೀಂಧ್ರನಾಶಕಗಳನ್ನು ಬಳಸಿ ಮತ್ತು ಪೀಡಿತ ಕೊಂಬೆಗಳನ್ನು ಕತ್ತರಿಸಿ.",
+        "advice_miner": "⚠️ **ಪರಿಹಾರ:** ಪೀಡಿತ ಎಲೆಗಳನ್ನು ತೆಗೆದುಹಾಕಿ ಮತ್ತು ಬೇವಿನ ಎಣ್ಣೆ ಚಿಕಿತ್ಸೆಯನ್ನು ಪರಿಗಣಿಸಿ.",
+        "advice_healthy": "✅ **ಶುಭ ಸುದ್ದಿ:** ಈ ಎಲೆಯು ಆರೋಗ್ಯಕರವಾಗಿ ಕಂಡುಬರುತ್ತದೆ!",
+        "footer": "ಸೂಚನೆ: ಕೃಷಿ ನಿರ್ಧಾರಗಳಿಗಾಗಿ ತಜ್ಞರನ್ನು ಸಂಪರ್ಕಿಸಿ."
     }
 }
 
-# --- 4. SIDEBAR ---
-with st.sidebar:
-    st.title("🌿 Settings")
-    lang = st.selectbox("Language / ಭಾಷೆ", ["English", "Kannada"])
-    st.markdown("---")
-    sensitivity = st.slider("Heatmap Sensitivity", 0.1, 0.9, 0.5)
+# Language Selection in Sidebar
+st.sidebar.title("Language / ಭಾಷೆ")
+lang = st.sidebar.radio("Select Language:", ("English", "ಕನ್ನಡ"))
+t = translations[lang]
 
-T = LANG_DICT[lang]
-class_names = load_class_names() # Loads the exact order from train.py
+@st.cache_resource
+def load_coffee_model():
+    if not os.path.exists(MODEL_PATH):
+        return None
+    return tf.keras.models.load_model(MODEL_PATH)
 
-# --- 5. MAIN INTERFACE ---
-st.title(T['title'])
-uploaded_file = st.file_uploader(T['upload'], type=["jpg", "png", "jpeg"])
+def load_labels():
+    if not os.path.exists(LABELS_PATH):
+        return ["Healthy", "Leaf_miner", "Rust"] # Fallback
+    with open(LABELS_PATH, 'r') as f:
+        return json.load(f)
 
-if uploaded_file:
-    image = Image.open(uploaded_file).convert('RGB')
+# Initialize
+model = load_coffee_model()
+class_names = load_labels()
+
+# UI Header
+st.title(t["title"])
+st.write(t["subtitle"])
+
+# Image Upload
+uploaded_file = st.file_uploader(t["uploader"], type=["jpg", "jpeg", "png"])
+
+if uploaded_file is not None:
+    image = Image.open(uploaded_file)
+    st.image(image, caption='Uploaded Image', use_column_width=True)
     
-    if not is_valid_leaf(image):
-        st.error(T['invalid'])
-        st.image(image, width=300, caption="Rejected Image")
-    else:
-        model = load_model()
-        if model:
-            img_resized = image.resize((224, 224))
-            img_array = np.expand_dims(tf.keras.preprocessing.image.img_to_array(img_resized), axis=0)
-
-            # Prediction
-            preds = model.predict(img_array)
-            idx = np.argmax(preds[0])
-            raw_label = class_names[idx] # Gets exact folder name
-            display_label = T['classes'].get(raw_label, raw_label) # Translates to UI language
-            conf = preds[0][idx] * 100
-
-            col1, col2 = st.columns([1, 1])
-
-            with col1:
-                st.image(image, caption="Uploaded Specimen", use_container_width=True)
+    if st.button(t["button"]):
+        if model is not None:
+            with st.spinner(t["loading"]):
+                img = image.resize((224, 224))
+                img_array = tf.keras.preprocessing.image.img_to_array(img)
+                img_array = np.expand_dims(img_array, axis=0)
                 
-            with col2:
-                st.markdown(f"""
-                    <div class="prediction-card">
-                        <h3>{T['analysis']}</h3>
-                        <h1>{display_label}</h1>
-                        <p>{T['conf']}: {conf:.2f}%</p>
-                    </div>
-                    """, unsafe_allow_html=True)
+                predictions = model.predict(img_array)
+                idx = np.argmax(predictions[0])
+                label_key = class_names[idx]
+                confidence = 100 * np.max(tf.nn.softmax(predictions[0]))
                 
-                # Grad-CAM Overlay
-                try:
-                    heatmap = get_refined_gradcam(img_array, model, "top_activation", sensitivity)
-                    heatmap_resized = cv2.resize(heatmap, (224, 224))
-                    heatmap_cv = np.uint8(255 * heatmap_resized)
-                    heatmap_color = cv2.applyColorMap(heatmap_cv, cv2.COLORMAP_JET)
-                    original_cv = cv2.cvtColor(np.array(img_resized), cv2.COLOR_RGB2BGR)
-                    superimposed = cv2.addWeighted(original_cv, 0.6, heatmap_color, 0.4, 0)
-                    st.image(cv2.cvtColor(superimposed, cv2.COLOR_BGR2RGB), caption="AI Heatmap", use_container_width=True)
-                except ValueError:
-                    st.warning("Grad-CAM is not available for this model architecture.")
+                # Show Results
+                st.subheader(f"{t[label_key]}")
+                st.write(f"**{t['confidence']}:** {confidence:.2f}%")
+                
+                # Advice logic
+                if label_key == "Rust":
+                    st.warning(t["advice_rust"])
+                elif label_key == "Leaf_miner":
+                    st.warning(t["advice_miner"])
+                else:
+                    st.success(t["advice_healthy"])
+        else:
+            st.error("Model Error")
 
-            st.markdown("---")
-            tab1, tab2 = st.tabs(["📋 " + T['advice'], "📊 Statistics"])
-            
-            with tab1:
-                tips_list = T['tips'].get(raw_label, ["Consult an agronomist."])
-                cols = st.columns(len(tips_list))
-                for i, tip in enumerate(tips_list):
-                    cols[i].success(tip)
-
-            with tab2:
-                # Plotly Chart
-                df = pd.DataFrame({
-                    'Disease': [T['classes'].get(c, c) for c in class_names], 
-                    'Prob': preds[0]
-                })
-                fig = px.bar(df, x='Prob', y='Disease', orientation='h', color='Prob', color_continuous_scale='Greens')
-                st.plotly_chart(fig, use_container_width=True)
+st.divider()
+st.caption(t["footer"])
