@@ -1,180 +1,275 @@
 import streamlit as st
 import tensorflow as tf
 import numpy as np
-import cv2
-import pandas as pd
+import json
+import os
+import google.generativeai as genai
 from PIL import Image
 import plotly.express as px
-import json
+import cv2
+import time
 
-# --- 1. PAGE CONFIG & STYLING ---
-st.set_page_config(page_title="CoffeeDoc AI", page_icon="☕", layout="wide")
+# --- CLOUD PATH CONFIGURATION ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, 'coffee_leaf_model.keras')
+LABELS_PATH = os.path.join(BASE_DIR, 'class_names.json')
 
+# Configure Gemini AI
+if "GEMINI_API_KEY" in st.secrets:
+    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+    model_chat = genai.GenerativeModel('gemini-2.5-flash')
+
+# Page Config MUST be the first Streamlit command
+st.set_page_config(page_title="CoffeeDoc AI", page_icon="☕", layout="wide", initial_sidebar_state="expanded")
+
+# --- CUSTOM CSS UI POLISH ---
 st.markdown("""
     <style>
-    .main { background-color: #f5f7f9; }
-    .prediction-card {
-        padding: 25px;
-        border-radius: 15px;
-        background: linear-gradient(135deg, #1e5128 0%, #4e944f 100%);
-        color: white;
-        text-align: center;
-        box-shadow: 0 10px 20px rgba(0,0,0,0.1);
+    /* Breathing animation for the main title */
+    @keyframes pulse {
+        0% { transform: scale(1); }
+        50% { transform: scale(1.02); }
+        100% { transform: scale(1); }
     }
-    .stMetric { background-color: #ffffff; padding: 15px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+    .hero-title {
+        animation: pulse 3s infinite ease-in-out;
+        background: -webkit-linear-gradient(45deg, #4CAF50, #1B5E20);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        text-align: center;
+        font-size: 3.5rem !important;
+        font-weight: 900;
+        padding-bottom: 10px;
+    }
+    .hero-subtitle {
+        text-align: center;
+        color: #666;
+        font-size: 1.2rem;
+        margin-bottom: 2rem;
+    }
+    /* Style the image uploader box */
+    [data-testid="stFileUploadDropzone"] {
+        border: 2px dashed #4CAF50;
+        border-radius: 15px;
+        background-color: #f1f8e9;
+    }
     </style>
     """, unsafe_allow_html=True)
 
-# --- 2. CORE LOGIC ---
-
-@st.cache_resource
-def load_model():
-    return tf.keras.models.load_model('coffee_leaf_model.keras')
-
-@st.cache_resource
-def load_class_names():
-    """Loads the exact label order saved during training."""
-    try:
-        with open('class_names.json', 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        st.warning("class_names.json not found! Using default alphabetical order.")
-        return ['Healthy', 'Leaf_miner', 'Rust']
-
-def is_valid_leaf(image):
-    """Gatekeeper: Checks if the image has enough green/leaf-like colors."""
-    img_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2HSV)
-    lower_green = np.array([25, 40, 40])
-    upper_green = np.array([95, 255, 255])
-    mask = cv2.inRange(img_cv, lower_green, upper_green)
-    green_ratio = np.sum(mask > 0) / (image.size[0] * image.size[1])
-    return green_ratio > 0.05
-
-def get_refined_gradcam(img_array, model, last_conv_layer_name, threshold):
-    """Refined Grad-CAM to isolate disease spots from background."""
-    grad_model = tf.keras.models.Model(
-        [model.inputs], [model.get_layer(last_conv_layer_name).output, model.output]
-    )
-    with tf.GradientTape() as tape:
-        last_conv_output, preds = grad_model(img_array)
-        class_idx = np.argmax(preds[0])
-        class_channel = preds[:, class_idx]
-
-    grads = tape.gradient(class_channel, last_conv_output)
-    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-    heatmap = last_conv_output[0] @ pooled_grads[..., tf.newaxis]
-    heatmap = tf.squeeze(heatmap)
-    
-    heatmap = tf.maximum(heatmap, 0) / tf.math.reduce_max(heatmap)
-    heatmap = heatmap.numpy()
-    heatmap[heatmap < threshold] = 0
-    return heatmap
-
-# --- 3. TRANSLATIONS ---
-LANG_DICT = {
-    'English': {
-        'title': "CoffeeDoc AI: Smart Diagnosis",
-        'upload': "Upload a leaf photo",
-        'analysis': "AI Diagnostic Analysis",
-        'conf': "Confidence Level",
-        'advice': "Farmer's Action Plan",
-        'invalid': "❌ Invalid Image: This doesn't look like a coffee leaf. Please take a clear photo of a leaf.",
-        'classes': {'Healthy': 'Healthy', 'Rust': 'Coffee Leaf Rust', 'Leaf_miner': 'Leaf Miner'},
-        'tips': {
-            'Healthy': ["Continue regular monitoring", "Check soil pH levels"],
-            'Rust': ["Apply Copper-based fungicide", "Prune for better airflow"],
-            'Leaf_miner': ["Introduce predatory wasps", "Remove infested leaves"]
-        }
+# --- TRANSLATIONS DICTIONARY ---
+translations = {
+    "English": {
+        "tab1": "🔍 Disease Diagnosis",
+        "tab2": "🤖 Coffee Expert Chat",
+        "title": "CoffeeDoc AI",
+        "subtitle": "Instant Coffee Leaf Diagnosis Powered by Deep Learning",
+        "uploader": "Drag and drop a leaf image here...",
+        "button": "✨ Analyze Leaf Health",
+        "loading1": "Extracting features from image...",
+        "loading2": "Running neural network analysis...",
+        "loading3": "Generating heatmaps...",
+        "confidence": "Confidence Level",
+        "Healthy": "Healthy",
+        "Rust": "Coffee Rust",
+        "Leaf_miner": "Leaf Miner",
+        "advice_rust": "⚠️ **Action:** Apply copper-based fungicides and prune affected branches.",
+        "advice_miner": "⚠️ **Action:** Remove mined leaves and consider organic neem oil.",
+        "advice_healthy": "✅ **Great News:** This leaf appears to be in excellent condition!",
+        "chat_title": "🤖 AI Agronomist",
+        "chat_info": "Ask me anything specifically about coffee farming, varieties, or pest control!",
+        "chat_placeholder": "How do I improve coffee yield?",
+        "api_warning": "⚠️ Please set up your Gemini API Key in Streamlit Secrets.",
+        "sys_prompt": "You are a professional Coffee Agronomist. Answer ONLY if related to coffee. Respond entirely in English. User Question: ",
+        "toast": "Welcome to CoffeeDoc AI! ☕"
     },
-    'Kannada': {
-        'title': "ಕಾಫಿಡಾಕ್ AI: ಸ್ಮಾರ್ಟ್ ರೋಗ ಪತ್ತೆ",
-        'upload': "ಎಲೆಯ ಚಿತ್ರವನ್ನು ಅಪ್‌ಲೋಡ್ ಮಾಡಿ",
-        'analysis': "AI ರೋಗನಿರ್ಣಯದ ವಿಶ್ಲೇಷಣೆ",
-        'conf': "ನಿಖರತೆಯ ಮಟ್ಟ",
-        'advice': "ರೈತರಿಗೆ ಸಲಹೆಗಳು",
-        'invalid': "❌ ಅಮಾನ್ಯ ಚಿತ್ರ: ಇದು ಕಾಫಿ ಎಲೆಯಂತೆ ಕಾಣುತ್ತಿಲ್ಲ. ದಯವಿಟ್ಟು ಸ್ಪಷ್ಟವಾದ ಎಲೆಯ ಫೋಟೋ ತೆಗೆಯಿರಿ.",
-        'classes': {'Healthy': 'ಆರೋಗ್ಯಕರ', 'Rust': 'ಎಲೆ ತುಕ್ಕು ರೋಗ', 'Leaf_miner': 'ಎಲೆ ಕೊರೆಯುವ ಹುಳು'},
-        'tips': {
-            'Healthy': ["ನಿಯಮಿತ ಮೇಲ್ವಿಚಾರಣೆ ಮುಂದುವರಿಸಿ", "ಮಣ್ಣಿನ pH ಮಟ್ಟವನ್ನು ಪರೀಕ್ಷಿಸಿ"],
-            'Rust': ["ತಾಮ್ರ ಆಧಾರಿತ ಶಿಲೀಂಧ್ರನಾಶಕ ಬಳಸಿ", "ಗಾಳಿಯಾಡಲು ಕೊಂಬೆ ಕತ್ತರಿಸಿ"],
-            'Leaf_miner': ["ಕೀಟನಾಶಕಗಳನ್ನು ಬಳಸಿ", "ಪೀಡಿತ ಎಲೆಗಳನ್ನು ಸುಟ್ಟು ಹಾಕಿ"]
-        }
+    "ಕನ್ನಡ": {
+        "tab1": "🔍 ರೋಗ ಪತ್ತೆ",
+        "tab2": "🤖 ಕಾಫಿ ತಜ್ಞರ ಚಾಟ್",
+        "title": "ಕಾಫಿಡಾಕ್ AI",
+        "subtitle": "ಡೀಪ್ ಲರ್ನಿಂಗ್ ಮೂಲಕ ಕಾಫಿ ಎಲೆಯ ತಕ್ಷಣದ ರೋಗ ಪತ್ತೆ",
+        "uploader": "ಎಲೆಯ ಚಿತ್ರವನ್ನು ಇಲ್ಲಿ ಹಾಕಿ...",
+        "button": "✨ ಎಲೆಯ ಆರೋಗ್ಯವನ್ನು ವಿಶ್ಲೇಷಿಸಿ",
+        "loading1": "ಚಿತ್ರದಿಂದ ಮಾಹಿತಿಯನ್ನು ಪಡೆಯಲಾಗುತ್ತಿದೆ...",
+        "loading2": "ನ್ಯೂರಲ್ ನೆಟ್‌ವರ್ಕ್ ವಿಶ್ಲೇಷಣೆ ನಡೆಯುತ್ತಿದೆ...",
+        "loading3": "ಹೀಟ್‌ಮ್ಯಾಪ್‌ಗಳನ್ನು ರಚಿಸಲಾಗುತ್ತಿದೆ...",
+        "confidence": "ನಂಬಿಕೆಯ ಮಟ್ಟ",
+        "Healthy": "ಆರೋಗ್ಯಕರವಾಗಿದೆ",
+        "Rust": "ಕಾಫಿ ತುಕ್ಕು ರೋಗ (Rust)",
+        "Leaf_miner": "ಎಲೆ ಕೊರೆಯುವ ಹುಳು (Leaf Miner)",
+        "advice_rust": "⚠️ **ಪರಿಹಾರ:** ತಾಮ್ರ ಆಧಾರಿತ ಶಿಲೀಂಧ್ರನಾಶಕಗಳನ್ನು ಬಳಸಿ ಮತ್ತು ಪೀಡಿತ ಕೊಂಬೆಗಳನ್ನು ಕತ್ತರಿಸಿ.",
+        "advice_miner": "⚠️ **ಪರಿಹಾರ:** ಪೀಡಿತ ಎಲೆಗಳನ್ನು ತೆಗೆದುಹಾಕಿ ಮತ್ತು ಬೇವಿನ ಎಣ್ಣೆ ಚಿಕಿತ್ಸೆಯನ್ನು ಪರಿಗಣಿಸಿ.",
+        "advice_healthy": "✅ **ಶುಭ ಸುದ್ದಿ:** ಈ ಎಲೆಯು ಅತ್ಯುತ್ತಮ ಸ್ಥಿತಿಯಲ್ಲಿ ಕಂಡುಬರುತ್ತದೆ!",
+        "chat_title": "🤖 ಕೃತಕ ಬುದ್ಧಿಮತ್ತೆ ಕೃಷಿ ತಜ್ಞ",
+        "chat_info": "ಕಾಫಿ ಕೃಷಿ, ರೋಗಗಳು ಅಥವಾ ಕೀಟಗಳ ನಿಯಂತ್ರಣದ ಬಗ್ಗೆ ಯಾವುದೇ ಪ್ರಶ್ನೆ ಕೇಳಿ!",
+        "chat_placeholder": "ಕಾಫಿ ಇಳುವರಿಯನ್ನು ಹೆಚ್ಚಿಸುವುದು ಹೇಗೆ?",
+        "api_warning": "⚠️ ದಯವಿಟ್ಟು Streamlit Secrets ನಲ್ಲಿ Gemini API ಕೀಯನ್ನು ಸೇರಿಸಿ.",
+        "sys_prompt": "ನೀವು ವೃತ್ತಿಪರ ಕಾಫಿ ಕೃಷಿ ತಜ್ಞರು. ಕಾಫಿ ಬೆಳೆಗೆ ಸಂಬಂಧಿಸಿದ ಪ್ರಶ್ನೆಗಳಿಗೆ ಮಾತ್ರ ಉತ್ತರಿಸಿ. ಸಂಪೂರ್ಣವಾಗಿ ಕನ್ನಡದಲ್ಲಿ ಮಾತ್ರ ಉತ್ತರಿಸಿ. ಬಳಕೆದಾರರ ಪ್ರಶ್ನೆ: ",
+        "toast": "ಕಾಫಿಡಾಕ್ AI ಗೆ ಸುಸ್ವಾಗತ! ☕"
     }
 }
 
-# --- 4. SIDEBAR ---
-with st.sidebar:
-    st.title("🌿 Settings")
-    lang = st.selectbox("Language / ಭಾಷೆ", ["English", "Kannada"])
-    st.markdown("---")
-    sensitivity = st.slider("Heatmap Sensitivity", 0.1, 0.9, 0.5)
+# --- SIDEBAR ---
+st.sidebar.title("Language / ಭಾಷೆ")
+lang = st.sidebar.radio("Select Language:", ("English", "ಕನ್ನಡ"), index=0)
+t = translations[lang]
 
-T = LANG_DICT[lang]
-class_names = load_class_names() # Loads the exact order from train.py
+# Welcome Toast (Only runs once per session)
+if "welcomed" not in st.session_state:
+    st.toast(t["toast"], icon="👋")
+    st.session_state.welcomed = True
 
-# --- 5. MAIN INTERFACE ---
-st.title(T['title'])
-uploaded_file = st.file_uploader(T['upload'], type=["jpg", "png", "jpeg"])
+st.sidebar.divider()
+st.sidebar.write("**Developed by:** Dhruva NL")
 
-if uploaded_file:
-    image = Image.open(uploaded_file).convert('RGB')
-    
-    if not is_valid_leaf(image):
-        st.error(T['invalid'])
-        st.image(image, width=300, caption="Rejected Image")
-    else:
-        model = load_model()
-        if model:
-            img_resized = image.resize((224, 224))
-            img_array = np.expand_dims(tf.keras.preprocessing.image.img_to_array(img_resized), axis=0)
+@st.cache_resource
+def load_coffee_model():
+    if not os.path.exists(MODEL_PATH):
+        return None
+    return tf.keras.models.load_model(MODEL_PATH)
 
-            # Prediction
-            preds = model.predict(img_array)
-            idx = np.argmax(preds[0])
-            raw_label = class_names[idx] # Gets exact folder name
-            display_label = T['classes'].get(raw_label, raw_label) # Translates to UI language
-            conf = preds[0][idx] * 100
+def load_labels():
+    if not os.path.exists(LABELS_PATH):
+        return ["Healthy", "Leaf_miner", "Rust"]
+    with open(LABELS_PATH, 'r') as f:
+        return json.load(f)
 
-            col1, col2 = st.columns([1, 1])
+model = load_coffee_model()
+class_names = load_labels()
 
-            with col1:
-                st.image(image, caption="Uploaded Specimen", use_container_width=True)
+# --- TABS SETUP ---
+tab1, tab2 = st.tabs([t["tab1"], t["tab2"]])
+
+# === TAB 1: DISEASE DIAGNOSIS ===
+with tab1:
+    st.markdown(f"<h1 class='hero-title'>☕ {t['title']}</h1>", unsafe_allow_html=True)
+    st.markdown(f"<p class='hero-subtitle'>{t['subtitle']}</p>", unsafe_allow_html=True)
+
+    uploaded_file = st.file_uploader(t["uploader"], type=["jpg", "jpeg", "png"])
+
+    if uploaded_file is not None:
+        image = Image.open(uploaded_file).convert("RGB")
+        
+        col_img1, col_img2, col_img3 = st.columns([1, 2, 1])
+        with col_img2:
+            st.image(image, caption='Uploaded Image', width='stretch')
+        
+        if st.button(t["button"], use_container_width=True):
+            if model is not None:
+                with st.status("🔍 Analyzing Leaf...", expanded=True) as status:
+                    st.write(t["loading1"])
+                    time.sleep(0.5)
+                    
+                    img = image.resize((224, 224))
+                    img_array = tf.keras.preprocessing.image.img_to_array(img)
+                    img_array = np.expand_dims(img_array, axis=0)
+                    
+                    st.write(t["loading2"])
+                    predictions = model.predict(img_array)
+                    scores = tf.nn.softmax(predictions[0]).numpy() * 100
+                    idx = np.argmax(predictions[0])
+                    label_key = class_names[idx]
+                    confidence = scores[idx]
+                    
+                    st.write(t["loading3"])
+                    status.update(label="Analysis Complete!", state="complete", expanded=False)
+
+                st.divider()
+
+                res_col1, res_col2 = st.columns([2, 1])
                 
-            with col2:
-                st.markdown(f"""
-                    <div class="prediction-card">
-                        <h3>{T['analysis']}</h3>
-                        <h1>{display_label}</h1>
-                        <p>{T['conf']}: {conf:.2f}%</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                # Grad-CAM Overlay
+                with res_col1:
+                    st.subheader(f"Diagnosis: **{t.get(label_key, label_key)}**")
+                    if label_key == "Rust":
+                        st.error(t["advice_rust"])
+                    elif label_key == "Leaf_miner":
+                        st.warning(t["advice_miner"])
+                    else:
+                        st.success(t["advice_healthy"])
+                        st.balloons()
+
+                with res_col2:
+                    st.metric(label=t["confidence"], value=f"{confidence:.2f}%", delta="High Accuracy" if confidence > 85 else "Needs Verification")
+
+                st.divider()
+
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    st.markdown("### 📊 Confidence Breakdown")
+                    fig = px.bar(
+                        x=class_names, 
+                        y=scores, 
+                        color=class_names,
+                        labels={'x': 'Disease Class', 'y': 'Confidence (%)'}
+                    )
+                    st.plotly_chart(fig, width='stretch')
+
+                with col2:
+                    st.markdown("### 🌡️ AI Detection Heatmap")
+                    st.caption("Red areas show exactly where the AI found signs of disease.")
+                    
+                    heatmap = np.zeros((224, 224))
+                    patch_size = 32
+                    baseline_prob = predictions[0][idx]
+                    
+                    occluded_images = []
+                    coords = []
+                    for y in range(0, 224, patch_size):
+                        for x in range(0, 224, patch_size):
+                            img_occ = np.copy(img_array[0])
+                            img_occ[y:y+patch_size, x:x+patch_size, :] = 0
+                            occluded_images.append(img_occ)
+                            coords.append((y, x))
+                            
+                    occluded_images = np.array(occluded_images)
+                    occ_preds = model.predict(occluded_images, verbose=0)
+                    
+                    for i, (y, x) in enumerate(coords):
+                        drop = baseline_prob - occ_preds[i][idx]
+                        heatmap[y:y+patch_size, x:x+patch_size] = drop
+                        
+                    heatmap = np.maximum(heatmap, 0)
+                    if np.max(heatmap) > 0:
+                        heatmap /= np.max(heatmap)
+                        
+                    heatmap_resized = cv2.resize(heatmap, (image.width, image.height))
+                    heatmap_color = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
+                    heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
+                    
+                    orig_img_arr = np.array(image)
+                    superimposed = cv2.addWeighted(orig_img_arr, 0.6, heatmap_color, 0.4, 0)
+                    
+                    st.image(superimposed, width='stretch')
+
+            else:
+                st.error("Model Error: Please check your GitHub files.")
+
+# === TAB 2: AI COFFEE EXPERT ===
+with tab2:
+    st.title(t["chat_title"])
+    st.info(t["chat_info"])
+
+    chat_history_key = f"messages_{lang}"
+    if chat_history_key not in st.session_state:
+        st.session_state[chat_history_key] = []
+
+    for message in st.session_state[chat_history_key]:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    if prompt := st.chat_input(t["chat_placeholder"]):
+        st.session_state[chat_history_key].append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            if "GEMINI_API_KEY" not in st.secrets:
+                st.warning(t["api_warning"])
+            else:
+                full_prompt = t["sys_prompt"] + prompt
                 try:
-                    heatmap = get_refined_gradcam(img_array, model, "top_activation", sensitivity)
-                    heatmap_resized = cv2.resize(heatmap, (224, 224))
-                    heatmap_cv = np.uint8(255 * heatmap_resized)
-                    heatmap_color = cv2.applyColorMap(heatmap_cv, cv2.COLORMAP_JET)
-                    original_cv = cv2.cvtColor(np.array(img_resized), cv2.COLOR_RGB2BGR)
-                    superimposed = cv2.addWeighted(original_cv, 0.6, heatmap_color, 0.4, 0)
-                    st.image(cv2.cvtColor(superimposed, cv2.COLOR_BGR2RGB), caption="AI Heatmap", use_container_width=True)
-                except ValueError:
-                    st.warning("Grad-CAM is not available for this model architecture.")
-
-            st.markdown("---")
-            tab1, tab2 = st.tabs(["📋 " + T['advice'], "📊 Statistics"])
-            
-            with tab1:
-                tips_list = T['tips'].get(raw_label, ["Consult an agronomist."])
-                cols = st.columns(len(tips_list))
-                for i, tip in enumerate(tips_list):
-                    cols[i].success(tip)
-
-            with tab2:
-                # Plotly Chart
-                df = pd.DataFrame({
-                    'Disease': [T['classes'].get(c, c) for c in class_names], 
-                    'Prob': preds[0]
-                })
-                fig = px.bar(df, x='Prob', y='Disease', orientation='h', color='Prob', color_continuous_scale='Greens')
-                st.plotly_chart(fig, use_container_width=True)
+                    response = model_chat.generate_content(full_prompt)
+                    st.markdown(response.text)
+                    st.session_state[chat_history_key].append({"role": "assistant", "content": response.text})
+                except Exception as e:
+                    st.error(f"API Error: {e}")
