@@ -9,14 +9,8 @@ The system uses **Deep Learning + Computer Vision** to identify diseases such as
 ---
 
 # 🚀 Live Demo
-
-Once deployed on Streamlit Cloud:
-
-https://your-app-name.streamlit.app
-
-*(Update this link after deployment)*
-
----
+ Streamlit Cloud:
+https://coffee-leaf-disease-detection-7skkgg47ykbmapyv5sxycj.streamlit.app/
 
 # ✨ Key Features
 
