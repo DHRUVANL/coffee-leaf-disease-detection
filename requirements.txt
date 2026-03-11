@@ -1,7 +1,8 @@
+tensorflow-cpu
 streamlit
-tensorflow-cpu==2.13.0
-numpy==1.24.3
-pandas
-pillow
-plotly
+numpy
+Pillow
 opencv-python-headless
+google-generativeai
+plotly
+pandas
